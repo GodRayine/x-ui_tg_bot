@@ -13,7 +13,7 @@ from xui import XUIClient
 def parse_admin_ids(raw: str) -> set[int]:
     if not raw:
         return set()
-    result = set()
+    result: set[int] = set()
     for x in raw.split(","):
         x = x.strip()
         if x.isdigit():
@@ -23,13 +23,24 @@ def parse_admin_ids(raw: str) -> set[int]:
 
 load_dotenv()
 
+# --- ENV ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 XUI_BASE_URL = os.getenv("XUI_BASE_URL", "").strip()
+XUI_WEBBASEPATH = os.getenv("XUI_WEBBASEPATH", "").strip()  # например "/EmptyArclight_panel" или ""
+XUI_API_PREFIX = os.getenv("XUI_API_PREFIX", "/panel/api").strip()  # "/panel/api" или "/api"
 XUI_USERNAME = os.getenv("XUI_USERNAME", "").strip()
 XUI_PASSWORD = os.getenv("XUI_PASSWORD", "").strip()
-XUI_TGID_FIELD = os.getenv("XUI_TGID_FIELD", "email").strip()
+
+# В актуальном 3x-ui у клиента есть штатное поле tgId
+XUI_TGID_FIELD = os.getenv("XUI_TGID_FIELD", "tgId").strip()
+
+# online  = прямо сейчас онлайн (onlines)
+# enabled = включён и не просрочен
 XUI_ACTIVE_MODE = os.getenv("XUI_ACTIVE_MODE", "enabled").strip().lower()
+
+# Если TLS self-signed: XUI_VERIFY_TLS=false
+XUI_VERIFY_TLS = os.getenv("XUI_VERIFY_TLS", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 DB_PATH = os.getenv("DB_PATH", "users.db").strip()
@@ -40,22 +51,30 @@ if not BOT_TOKEN:
 if XUI_ACTIVE_MODE not in {"enabled", "online"}:
     raise RuntimeError("XUI_ACTIVE_MODE must be 'enabled' or 'online'")
 
-
+# --- BOT ---
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 storage = Storage(DB_PATH)
+
 xui = XUIClient(
     base_url=XUI_BASE_URL,
     username=XUI_USERNAME,
     password=XUI_PASSWORD,
     tg_field=XUI_TGID_FIELD,
     active_mode=XUI_ACTIVE_MODE,
+    web_basepath=XUI_WEBBASEPATH,
+    api_prefix=XUI_API_PREFIX,
+    verify_tls=XUI_VERIFY_TLS,
 )
 
 
 def is_admin(tg_id: int) -> bool:
     return tg_id in ADMIN_IDS
+
+
+def xui_config_ok() -> bool:
+    return bool(XUI_BASE_URL and XUI_USERNAME and XUI_PASSWORD)
 
 
 @dp.message(Command("start"))
@@ -65,10 +84,11 @@ async def start(message: Message):
 
     text = (
         "Привет! Я бот для работы с 3x-ui.\n\n"
-        f"Ваш Telegram ID: <code>{tg_id}</code>\n\n"
+        f"Ваш Telegram ID: {tg_id}\n\n"
         "Команды:\n"
         "  /id — показать ваш TG ID\n"
         "  /active — активные клиенты по вашему TG ID\n"
+        "  /whoami — показать роль\n"
     )
 
     if is_admin(tg_id):
@@ -85,7 +105,7 @@ async def start(message: Message):
 async def cmd_id(message: Message):
     tg_id = message.from_user.id
     storage.upsert_user(tg_id)
-    await message.answer(f"Ваш Telegram ID: <code>{tg_id}</code>")
+    await message.answer(f"Ваш Telegram ID: {tg_id}")
 
 
 @dp.message(Command("whoami"))
@@ -93,52 +113,7 @@ async def cmd_whoami(message: Message):
     tg_id = message.from_user.id
     storage.upsert_user(tg_id)
     role = "админ" if is_admin(tg_id) else "пользователь"
-    await message.answer(f"TG ID: <code>{tg_id}</code>\nРоль: <b>{role}</b>")
-
-
-@dp.message(Command("active"))
-async def cmd_active(message: Message):
-    tg_id = message.from_user.id
-    storage.upsert_user(tg_id)
-
-    if not (XUI_BASE_URL and XUI_USERNAME and XUI_PASSWORD):
-        await message.answer("XUI_* переменные не заполнены в .env (BASE_URL/USERNAME/PASSWORD).")
-        return
-
-    try:
-        clients = await xui.get_active_clients_for_tg(tg_id)
-    except Exception as e:
-        await message.answer(f"Ошибка запроса к 3x-ui: <code>{type(e).__name__}: {e}</code>")
-        return
-
-    if not clients:
-        await message.answer(
-            "Активные клиенты не найдены.\n\n"
-            "Проверьте привязку TG ID к клиенту в 3x-ui.\n"
-            f"Сейчас бот ищет TG ID в поле: <b>{XUI_TGID_FIELD}</b>\n"
-            "Рекомендуемая схема: email='tg:ВАШ_TG_ID' (или remark).\n\n"
-            f"Режим активных: <b>{XUI_ACTIVE_MODE}</b>"
-        )
-        return
-
-    lines = [f"Найдены активные клиенты (режим: <b>{XUI_ACTIVE_MODE}</b>):"]
-    for item in clients[:30]:
-        c = item["client"]
-        email = c.get("email") or c.get("remark") or "(no email/remark)"
-        uuid = c.get("id") or c.get("uuid") or "(no id)"
-        enabled = c.get("enable")
-        exp = c.get("expiryTime")
-        lines.append(
-            f"• inbound #{item['inbound_id']} ({item.get('protocol')}:{item.get('port')})\n"
-            f"  email/remark: <code>{email}</code>\n"
-            f"  id/uuid: <code>{uuid}</code>\n"
-            f"  enable: <code>{enabled}</code>, expiryTime: <code>{exp}</code>"
-        )
-
-    if len(clients) > 30:
-        lines.append(f"\nПоказано 30 из {len(clients)}.")
-
-    await message.answer("\n".join(lines))
+    await message.answer(f"TG ID: {tg_id}\nРоль: {role}")
 
 
 @dp.message(Command("users"))
@@ -150,7 +125,7 @@ async def cmd_users(message: Message):
         await message.answer("У вас нет прав администратора.")
         return
 
-    await message.answer(f"Пользователей в базе: <b>{storage.count_users()}</b>")
+    await message.answer(f"Пользователей в базе: {storage.count_users()}")
 
 
 @dp.message(Command("broadcast"))
@@ -181,14 +156,67 @@ async def cmd_broadcast(message: Message):
         except Exception:
             failed += 1
 
-    await message.answer(f"Рассылка завершена.\nОтправлено: <b>{sent}</b>\nОшибок: <b>{failed}</b>")
+    await message.answer(f"Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}")
+
+
+@dp.message(Command("active"))
+async def cmd_active(message: Message):
+    tg_id = message.from_user.id
+    storage.upsert_user(tg_id)
+
+    if not xui_config_ok():
+        await message.answer("XUI_* переменные не заполнены в .env (BASE_URL/USERNAME/PASSWORD).")
+        return
+
+    try:
+        clients = await xui.get_active_clients_for_tg(tg_id)
+    except Exception as e:
+        debug = (
+            f"base_url: {XUI_BASE_URL}\n"
+            f"web_basepath: {XUI_WEBBASEPATH or '(empty)'}\n"
+            f"api_prefix: {XUI_API_PREFIX}\n"
+            f"active_mode: {XUI_ACTIVE_MODE}\n"
+            f"tg_field: {XUI_TGID_FIELD}\n"
+            f"verify_tls: {XUI_VERIFY_TLS}"
+        )
+        await message.answer(f"Ошибка запроса к 3x-ui: {type(e).__name__}: {e}\n\n{debug}")
+        return
+
+    if not clients:
+        await message.answer(
+            "Активные клиенты не найдены.\n\n"
+            "Проверьте, что у клиента в 3x-ui заполнено поле Telegram ID (tgId) вашим TG ID.\n"
+            f"Сейчас бот ищет по полю: {XUI_TGID_FIELD}\n"
+            f"Режим активных: {XUI_ACTIVE_MODE}"
+        )
+        return
+
+    lines = [f"Найдены активные клиенты (режим: {XUI_ACTIVE_MODE}):"]
+    for item in clients[:30]:
+        c = item["client"]
+        email = c.get("email") or c.get("remark") or "(no email/remark)"
+        uuid = c.get("id") or c.get("uuid") or "(no id)"
+        tgId = c.get("tgId", "(no tgId)")
+        enabled = c.get("enable")
+        exp = c.get("expiryTime")
+        lines.append(
+            f"• inbound #{item['inbound_id']} ({item.get('protocol')}:{item.get('port')})\n"
+            f"  tgId: {tgId}\n"
+            f"  email/remark: {email}\n"
+            f"  id/uuid: {uuid}\n"
+            f"  enable: {enabled}, expiryTime: {exp}"
+        )
+
+    if len(clients) > 30:
+        lines.append(f"\nПоказано 30 из {len(clients)}.")
+
+    await message.answer("\n".join(lines))
 
 
 async def main():
-    # Пробуем логин сразу, но если не получится — бот всё равно запустится,
-    # а /active покажет ошибку запроса.
+    # Пробуем логин при старте — если не получится, бот всё равно запустится.
     try:
-        if XUI_BASE_URL and XUI_USERNAME and XUI_PASSWORD:
+        if xui_config_ok():
             await xui.login()
     except Exception:
         pass
