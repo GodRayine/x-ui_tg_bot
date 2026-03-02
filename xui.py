@@ -7,16 +7,16 @@ import httpx
 
 class XUIClient:
     """
-    Актуальные endpoints по wiki:
-      - POST /login
-      - Base: /panel/api/inbounds
-          GET  /list
-          POST /onlines
-          GET  /getClientTraffics/:email (если понадобится)
+    3x-ui REST client с поддержкой:
+      - web_basepath (WEBBASEPATH / secret path), напр. "/EmptyArclight_panel" или ""
+      - api_prefix   (где живёт API), напр. "/panel/api" (обычно) или "/api" (за reverse proxy)
+      - tgId         (штатное поле Telegram ID у клиента)
+      - active_mode  ("online" через /inbounds/onlines или "enabled" по enable/expiryTime)
 
-    ВНИМАНИЕ:
-    У 3x-ui /login часто принимает JSON (как в wiki). В некоторых окружениях может принимать form-data.
-    Здесь сделано через JSON. Если не заходит — замените json=... на data=...
+    Итоговые пути:
+      login:   {web_basepath}/login
+      list:    {web_basepath}{api_prefix}/inbounds/list
+      onlines: {web_basepath}{api_prefix}/inbounds/onlines
     """
 
     def __init__(
@@ -24,27 +24,61 @@ class XUIClient:
         base_url: str,
         username: str,
         password: str,
-        tg_field: str = "email",
-        active_mode: str = "enabled",  # enabled | online
+        tg_field: str = "tgId",
+        active_mode: str = "enabled",   # enabled | online
+        web_basepath: str = "",         # например "/EmptyArclight_panel" или ""
+        api_prefix: str = "/panel/api", # "/panel/api" или "/api"
+        verify_tls: bool = True,
+        timeout: float = 20.0,
     ):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url or "").rstrip("/")
         self.username = username
         self.password = password
-        self.tg_field = tg_field
-        self.active_mode = active_mode
+
+        self.tg_field = (tg_field or "tgId").strip()
+        self.active_mode = (active_mode or "enabled").strip().lower()
+
+        self.web_basepath = self._norm_path(web_basepath)
+        self.api_prefix = self._norm_path(api_prefix) or "/panel/api"
 
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
-            timeout=20.0,
+            timeout=timeout,
             follow_redirects=True,
+            verify=verify_tls,
         )
 
-    async def close(self):
+    # ---- helpers ----
+    @staticmethod
+    def _norm_path(p: str) -> str:
+        p = (p or "").strip()
+        if not p:
+            return ""
+        if not p.startswith("/"):
+            p = "/" + p
+        return p.rstrip("/")
+
+    def _api(self, suffix: str) -> str:
+        """
+        Собирает: {web_basepath}{api_prefix}{suffix}
+        suffix должен начинаться с /
+        """
+        if not suffix.startswith("/"):
+            suffix = "/" + suffix
+        return f"{self.web_basepath}{self.api_prefix}{suffix}"
+
+    def _login_url(self) -> str:
+        return f"{self.web_basepath}/login" if self.web_basepath else "/login"
+
+    # ---- http ----
+    async def close(self) -> None:
         await self.client.aclose()
 
     async def login(self) -> None:
+        # По актуальной документации 3x-ui логин часто принимает JSON.
+        # Если у вас ожидается form-data, замените json=... на data=...
         r = await self.client.post(
-            "/login",
+            self._login_url(),
             json={"username": self.username, "password": self.password},
         )
         r.raise_for_status()
@@ -57,30 +91,28 @@ class XUIClient:
         r.raise_for_status()
         return r
 
+    # ---- API ----
     async def list_inbounds(self) -> List[Dict[str, Any]]:
-        # GET /panel/api/inbounds/list
-        r = await self._request("GET", "/panel/api/inbounds/list")
+        r = await self._request("GET", self._api("/inbounds/list"))
         data = r.json()
+        # обычно {"success": true, "obj": [...]}
         return data.get("obj", []) if isinstance(data, dict) else []
 
     async def online_emails(self) -> Set[str]:
-        # POST /panel/api/inbounds/onlines
-        r = await self._request("POST", "/panel/api/inbounds/onlines", json={})
+        r = await self._request("POST", self._api("/inbounds/onlines"), json={})
         data = r.json()
         obj = data.get("obj", []) if isinstance(data, dict) else []
-        if isinstance(obj, list):
-            return {str(x) for x in obj}
-        return set()
+        return {str(x) for x in obj} if isinstance(obj, list) else set()
 
+    # ---- parsing / filtering ----
     def _extract_clients_from_inbound(self, inbound: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Обычно inbound.settings — JSON-строка, внутри есть {"clients":[...]}
-        Иногда settings уже dict.
-        Иногда статистика клиентов в inbound.clientStats
+        inbound["settings"] часто JSON-строка вида {"clients":[...]}
+        иногда settings уже dict.
         """
+        settings = inbound.get("settings")
         clients: List[Dict[str, Any]] = []
 
-        settings = inbound.get("settings")
         if isinstance(settings, dict):
             clients = settings.get("clients", []) or []
         elif isinstance(settings, str):
@@ -90,37 +122,22 @@ class XUIClient:
             except Exception:
                 clients = []
 
-        stats = inbound.get("clientStats") or inbound.get("clientStat") or []
-        if isinstance(stats, list) and isinstance(clients, list) and clients:
-            stat_by_key: Dict[str, Dict[str, Any]] = {}
-            for s in stats:
-                key = s.get("email") or s.get("remark") or s.get("id") or s.get("uuid")
-                if key is not None:
-                    stat_by_key[str(key)] = s
-            for c in clients:
-                key = c.get("email") or c.get("remark") or c.get("id") or c.get("uuid")
-                if key is not None and str(key) in stat_by_key:
-                    c["_stat"] = stat_by_key[str(key)]
-
         return clients if isinstance(clients, list) else []
 
     def _client_matches_tg_id(self, client: Dict[str, Any], tg_id: int) -> bool:
         """
-        В актуальном 3x-ui у клиента есть поле tgId (int64) — используем его напрямую.
-        Если tg_field != tgId (например remark/email/comment), оставляем строковый поиск.
+        В актуальном 3x-ui штатное поле Telegram ID: tgId (int64).
+        Если tg_field = tgId — сравниваем числом.
+        Иначе fallback: строковый поиск по выбранному полю.
         """
-        # Нормализуем имя поля
         field = (self.tg_field or "").strip()
 
         if field.lower() == "tgid" or field == "tgId":
-            v = client.get("tgId")
-            # tgId по модели int64, но на всякий случай допускаем строку
             try:
-                return int(v) == int(tg_id)
+                return int(client.get("tgId")) == int(tg_id)
             except Exception:
                 return False
 
-        # fallback: старый режим (по строковому полю)
         v = client.get(field)
         if v is None and field != "email":
             v = client.get("email")
@@ -140,12 +157,17 @@ class XUIClient:
             now_ms = int(time.time() * 1000)
             if exp < now_ms:
                 return False
+
         return True
 
     async def get_active_clients_for_tg(self, tg_id: int) -> List[Dict[str, Any]]:
+        """
+        Возвращает список найденных клиентов (с контекстом inbound),
+        отфильтрованных по tgId и "активности".
+        """
         inbounds = await self.list_inbounds()
 
-        online = set()
+        online: Set[str] = set()
         if self.active_mode == "online":
             online = await self.online_emails()
 
