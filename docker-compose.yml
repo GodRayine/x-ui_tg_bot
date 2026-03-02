@@ -1,0 +1,13 @@
+services:
+  tg-bot:
+    build: .
+    container_name: xui_tg_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # сохраняем sqlite наружу
+      - ./data:/app/data
+    environment:
+      # чтобы DB лежала в volume
+      - DB_PATH=/app/data/users.db
